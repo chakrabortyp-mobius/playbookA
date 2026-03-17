@@ -1,7 +1,7 @@
 """
 mae.py
 ======
-Mask-Aware Autoencoder — no CLI arguments, edit config at top.
+Mask-Aware Autoencoder with configurable random masking.
 
 Input  : merged_tensor_65x103.csv
 Outputs: mae_outputs/mae_latents.parquet
@@ -16,7 +16,6 @@ Run:
 import os
 import json
 import time
-import traceback
 
 import numpy as np
 import pandas as pd
@@ -34,32 +33,41 @@ CSV_PATH   = "merged_tensor.csv"
 OUTPUT_DIR = "mae_outputs"
 
 # Architecture
-FEATURE_DIM      = 103
-LATENT_DIM       = 32
-ENCODER_LAYERS   = [64, 48]       # hidden layer sizes
-DECODER_LAYERS   = [48, 64]
-ACTIVATION       = "relu"
-DROPOUT          = 0.0
-BATCH_NORM       = False
+FEATURE_DIM    = 103
+LATENT_DIM     = 32
+ENCODER_LAYERS = [64, 48]
+DECODER_LAYERS = [48, 64]
+ACTIVATION     = "relu"
+DROPOUT        = 0.0
+BATCH_NORM     = False
+
+# ── Random masking ────────────────────────────────────────────────────────────
+# Applied on top of structural masks (OECD/BIS missing dims).
+# During training each row gets an additional random fraction of dims zeroed out.
+# At inference time random masking is OFF — only structural masks apply.
+RANDOM_MASK_ENABLED  = True
+RANDOM_MASK_MIN      = 0.20   # minimum additional fraction to mask  (20%)
+RANDOM_MASK_MAX      = 0.30   # maximum additional fraction to mask  (30%)
+# Example: a row with 103 dims will have 20–30 extra dims randomly zeroed per batch
 
 # Training
-EPOCHS           = 300
-LEARNING_RATE    = 1e-3
-BATCH_SIZE       = 16
-WEIGHT_DECAY     = 1e-4
-LOSS_EPS         = 1e-6
-GRAD_CLIP        = True
-GRAD_CLIP_NORM   = 1.0
-EARLY_STOPPING   = True
-ES_PATIENCE      = 30
-ES_MIN_DELTA     = 1e-6
-VAL_SPLIT        = 0.0           # fraction of markets held out for validation
+EPOCHS         = 300
+LEARNING_RATE  = 1e-3
+BATCH_SIZE     = 16
+WEIGHT_DECAY   = 1e-4
+LOSS_EPS       = 1e-6
+GRAD_CLIP      = True
+GRAD_CLIP_NORM = 1.0
+EARLY_STOPPING = True
+ES_PATIENCE    = 30
+ES_MIN_DELTA   = 1e-6
+VAL_SPLIT      = 0.0
 
 # Init
-WEIGHT_INIT      = "xavier_uniform"
-BIAS_INIT        = "zeros"
-RANDOM_SEED      = 42
-PRINT_EVERY      = 50             # print summary every N epochs
+WEIGHT_INIT  = "xavier_uniform"
+BIAS_INIT    = "zeros"
+RANDOM_SEED  = 42
+PRINT_EVERY  = 50
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -95,13 +103,58 @@ def init_weights(module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MODEL  (mirrors Kumar's MaskAwareAutoencoder exactly)
+# RANDOM MASKING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def apply_random_mask(x: torch.Tensor, struct_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Adds random masking on top of the structural mask during training.
+
+    For each row independently:
+      1. Find dims that are currently observed (struct_mask == 1)
+      2. Randomly zero out RANDOM_MASK_MIN–RANDOM_MASK_MAX fraction of them
+      3. Return the combined mask (structural + random)
+
+    This forces the MAE to learn to reconstruct from partial observations,
+    making the latent z_m1 more robust and generalizable.
+    """
+    if not RANDOM_MASK_ENABLED:
+        return struct_mask
+
+    batch_size, n_dims = x.shape
+    combined_mask = struct_mask.clone()
+
+    for i in range(batch_size):
+        # Indices that are structurally observed
+        observed_idx = torch.where(struct_mask[i] == 1)[0]
+        n_observed   = len(observed_idx)
+
+        if n_observed == 0:
+            continue
+
+        # How many dims to additionally mask this row
+        frac      = np.random.uniform(RANDOM_MASK_MIN, RANDOM_MASK_MAX)
+        n_to_mask = max(1, int(round(frac * n_dims)))
+
+        # Can only mask dims that are currently observed
+        n_to_mask = min(n_to_mask, n_observed)
+
+        # Randomly pick which observed dims to zero out
+        perm       = torch.randperm(n_observed)
+        mask_these = observed_idx[perm[:n_to_mask]]
+        combined_mask[i, mask_these] = 0
+
+    return combined_mask
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEL
 # ══════════════════════════════════════════════════════════════════════════════
 
 class MAEEncoder(nn.Module):
     def __init__(self):
         super().__init__()
-        prev  = 2 * FEATURE_DIM        # [x ‖ mask] concatenated → 206
+        prev   = 2 * FEATURE_DIM      # [x ‖ mask] → 206
         layers = []
         for units in ENCODER_LAYERS:
             layers.append(nn.Linear(prev, units))
@@ -121,7 +174,7 @@ class MAEEncoder(nn.Module):
 class MAEDecoder(nn.Module):
     def __init__(self):
         super().__init__()
-        prev  = LATENT_DIM
+        prev   = LATENT_DIM
         layers = []
         for units in DECODER_LAYERS:
             layers.append(nn.Linear(prev, units))
@@ -151,13 +204,17 @@ class MaskAwareAutoencoder(nn.Module):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LOSS  (mirrors Kumar's mae_loss exactly)
+# LOSS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def mae_loss(x_hat, x_true, mask):
-    err  = torch.square(x_hat - x_true) * mask
-    num  = torch.sum(err, dim=1)
-    den  = torch.clamp(torch.sum(mask, dim=1), min=LOSS_EPS)
+    """
+    Masked MSE — only observed dims contribute to loss.
+    Loss is normalised by number of observed dims per row.
+    """
+    err = torch.square(x_hat - x_true) * mask
+    num = torch.sum(err, dim=1)
+    den = torch.clamp(torch.sum(mask, dim=1), min=LOSS_EPS)
     return torch.mean(num / den)
 
 
@@ -165,38 +222,63 @@ def mae_loss(x_hat, x_true, mask):
 # DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
+def build_structural_mask(sub_df: pd.DataFrame, dim_cols: list) -> torch.Tensor:
+    """
+    Structural mask: 0 for dims that are permanently missing due to absent
+    data sources (OECD for India/Nigeria, BIS for Nigeria).
+    This mask is fixed and applies at both train and inference time.
+    """
+    X = torch.tensor(sub_df[dim_cols].values, dtype=torch.float32)
+    M = torch.ones_like(X)
+    for i, (_, row) in enumerate(sub_df.iterrows()):
+        if row["obs_pct"] < 100.0:
+            if row["market"] in ["IN-LOG", "NG-FIN"]:
+                M[i, 24:28] = 0   # regulatory dims — OECD absent
+                M[i, 32:36] = 0   # techprod dims   — OECD absent
+            if row["market"] == "NG-FIN":
+                M[i, 64:68] = 0   # temporal dims   — BIS absent
+    return X, M
+
+
 def load_data():
     df       = pd.read_csv(CSV_PATH)
     meta     = ["market", "year", "obs_pct"]
     dim_cols = [c for c in df.columns if c not in meta]
     assert len(dim_cols) == 103, f"Expected 103 dims, got {len(dim_cols)}"
 
-    # Train / val split by market
-    markets   = df["market"].unique().tolist()
-    rng       = np.random.default_rng(RANDOM_SEED)
-    n_val     = max(1, round(len(markets) * VAL_SPLIT))
-    val_mkts  = rng.choice(markets, size=n_val, replace=False).tolist()
-    trn_mkts  = [m for m in markets if m not in val_mkts]
+    markets  = df["market"].unique().tolist()
+    rng      = np.random.default_rng(RANDOM_SEED)
+    n_val    = max(1, round(len(markets) * VAL_SPLIT))
+    val_mkts = rng.choice(markets, size=n_val, replace=False).tolist()
+    trn_mkts = [m for m in markets if m not in val_mkts]
 
     print(f"  Train markets : {trn_mkts}")
     print(f"  Val markets   : {val_mkts}")
 
-    def to_dataset(sub_df):
-        X = torch.tensor(sub_df[dim_cols].values, dtype=torch.float32)
-        M = torch.ones_like(X)
-        for i, (_, row) in enumerate(sub_df.iterrows()):
-            if row["obs_pct"] < 100.0:
-                if row["market"] in ["IN-LOG", "NG-FIN"]:
-                    M[i, 24:28] = 0
-                    M[i, 32:36] = 0
-                if row["market"] == "NG-FIN":
-                    M[i, 64:68] = 0
-        return TensorDataset(X, M)
-
     trn_df = df[df["market"].isin(trn_mkts)].reset_index(drop=True)
     val_df = df[df["market"].isin(val_mkts)].reset_index(drop=True)
 
-    return to_dataset(trn_df), to_dataset(val_df), df, dim_cols
+    X_trn, M_trn = build_structural_mask(trn_df, dim_cols)
+    X_val, M_val = build_structural_mask(val_df, dim_cols)
+
+    # Report masking summary
+    struct_masked_trn = (M_trn == 0).sum().item()
+    total_trn         = M_trn.numel()
+    print(f"\n  Structural mask (train) : {struct_masked_trn}/{total_trn} dims zeroed "
+          f"({100*struct_masked_trn/total_trn:.1f}%)")
+
+    if RANDOM_MASK_ENABLED:
+        avg_rand = (RANDOM_MASK_MIN + RANDOM_MASK_MAX) / 2 * 100
+        print(f"  Random mask (train)     : additional {RANDOM_MASK_MIN*100:.0f}%–"
+              f"{RANDOM_MASK_MAX*100:.0f}% per row per batch (avg ~{avg_rand:.0f}%)")
+        avg_total = struct_masked_trn/total_trn + (RANDOM_MASK_MIN+RANDOM_MASK_MAX)/2
+        print(f"  Combined avg masked     : ~{min(avg_total*100, 100):.1f}% of dims per row")
+    else:
+        print(f"  Random mask             : disabled")
+
+    return (TensorDataset(X_trn, M_trn),
+            TensorDataset(X_val, M_val),
+            df, dim_cols)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -209,22 +291,33 @@ def train(model, train_ds, val_ds, device):
     optimizer    = optim.Adam(model.parameters(), lr=LEARNING_RATE,
                               weight_decay=WEIGHT_DECAY)
 
-    history          = {"train_loss": [], "val_loss": []}
-    best_val_loss    = float("inf")
-    best_epoch       = 0
-    patience_counter = 0
-    best_state       = None
+    history       = {"train_loss": [], "val_loss": []}
+    best_val_loss = float("inf")
+    best_epoch    = 0
+    patience_ctr  = 0
+    best_state    = None
 
     for epoch in range(EPOCHS):
         t0 = time.time()
 
-        # Train
+        # ── Train ─────────────────────────────────────────────────────────────
         model.train()
         train_losses = []
         for xb, mb in train_loader:
-            xb, mb   = xb.to(device), mb.to(device)
-            x_hat, _ = model(xb, mb)
-            loss     = mae_loss(x_hat, xb, mb)
+            xb, mb = xb.to(device), mb.to(device)
+
+            # Apply random masking on top of structural mask
+            mb_aug = apply_random_mask(xb, mb)
+
+            # Zero out the randomly masked input dims too
+            xb_masked = xb * mb_aug
+
+            x_hat, _ = model(xb_masked, mb_aug)
+
+            # Loss computed against FULL structural mask (not augmented)
+            # so the model is penalised for ALL structurally observed dims
+            loss = mae_loss(x_hat, xb, mb)
+
             optimizer.zero_grad()
             loss.backward()
             if GRAD_CLIP:
@@ -232,12 +325,13 @@ def train(model, train_ds, val_ds, device):
             optimizer.step()
             train_losses.append(loss.item())
 
-        # Validate
+        # ── Validate ──────────────────────────────────────────────────────────
         model.eval()
         val_losses = []
         with torch.no_grad():
             for xb, mb in val_loader:
                 xb, mb   = xb.to(device), mb.to(device)
+                # No random masking at validation — structural mask only
                 x_hat, _ = model(xb, mb)
                 val_losses.append(mae_loss(x_hat, xb, mb).item())
 
@@ -252,23 +346,22 @@ def train(model, train_ds, val_ds, device):
                   f"train={avg_train:.6f}  val={avg_val:.6f}  "
                   f"t={time.time()-t0:.2f}s")
 
-        # Best model
         if avg_val < best_val_loss - ES_MIN_DELTA:
-            best_val_loss    = avg_val
-            best_epoch       = epoch + 1
-            patience_counter = 0
-            best_state       = {k: v.cpu().clone()
-                                for k, v in model.state_dict().items()}
+            best_val_loss = avg_val
+            best_epoch    = epoch + 1
+            patience_ctr  = 0
+            best_state    = {k: v.cpu().clone()
+                             for k, v in model.state_dict().items()}
             print(f"  ✓ Best  epoch={best_epoch}  val={best_val_loss:.6f}")
         else:
-            patience_counter += 1
+            patience_ctr += 1
 
-        if EARLY_STOPPING and patience_counter >= ES_PATIENCE:
+        if EARLY_STOPPING and patience_ctr >= ES_PATIENCE:
             print(f"\n  Early stop at epoch {epoch+1}. "
                   f"Best={best_epoch}, val={best_val_loss:.6f}")
             break
 
-    # Save checkpoint
+    # Save
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     model_config = {
         "feature_dim": FEATURE_DIM, "latent_dim": LATENT_DIM,
@@ -276,6 +369,8 @@ def train(model, train_ds, val_ds, device):
                     "dropout": DROPOUT, "batch_norm": BATCH_NORM},
         "decoder": {"layer_sizes": DECODER_LAYERS, "activation": ACTIVATION,
                     "dropout": DROPOUT, "batch_norm": BATCH_NORM},
+        "random_mask": {"enabled": RANDOM_MASK_ENABLED,
+                        "min": RANDOM_MASK_MIN, "max": RANDOM_MASK_MAX},
     }
     torch.save({
         "epoch": best_epoch, "model_state_dict": best_state,
@@ -289,12 +384,11 @@ def train(model, train_ds, val_ds, device):
 
     print(f"\n  Model  → {OUTPUT_DIR}/mae_best_model.pth")
     print(f"  History→ {OUTPUT_DIR}/mae_training_history.json")
-
     return best_state
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# INFERENCE
+# INFERENCE  — structural mask only, no random masking
 # ══════════════════════════════════════════════════════════════════════════════
 
 def run_inference(model, best_state, full_df, dim_cols, device):
@@ -302,15 +396,7 @@ def run_inference(model, best_state, full_df, dim_cols, device):
     model.eval()
     model.to(device)
 
-    X = torch.tensor(full_df[dim_cols].values, dtype=torch.float32)
-    M = torch.ones_like(X)
-    for i, (_, row) in enumerate(full_df.iterrows()):
-        if row["obs_pct"] < 100.0:
-            if row["market"] in ["IN-LOG", "NG-FIN"]:
-                M[i, 24:28] = 0
-                M[i, 32:36] = 0
-            if row["market"] == "NG-FIN":
-                M[i, 64:68] = 0
+    X, M = build_structural_mask(full_df.reset_index(drop=True), dim_cols)
 
     loader = DataLoader(TensorDataset(X, M), batch_size=BATCH_SIZE, shuffle=False)
 
@@ -343,18 +429,21 @@ def run_inference(model, best_state, full_df, dim_cols, device):
     print(f"  z_m1 → {OUTPUT_DIR}/mae_latents.parquet        shape={Z.shape}")
     print(f"  x̂    → {OUTPUT_DIR}/mae_reconstructed.parquet  shape={Xhat.shape}")
 
-    # Per-market reconstruction error
-    print(f"\n  Reconstruction error (observed dims only):")
-    print(f"  {'Market':<10}  {'MSE':>10}  {'obs%':>6}")
-    print(f"  {'-'*30}")
+    # Per-market reconstruction error (structural mask only)
+    print(f"\n  Reconstruction error (structural mask, observed dims only):")
+    print(f"  {'Market':<10}  {'MSE':>10}  {'obs%':>6}  {'masked_dims':>12}")
+    print(f"  {'-'*46}")
+    X_np = X.numpy()
+    M_np = M.numpy()
     for market in full_df["market"].unique():
-        idx = full_df[full_df["market"] == market].index.tolist()
-        xb  = X[idx].numpy()
-        mb  = M[idx].numpy()
-        xhb = Xhat[idx]
-        err = np.mean(np.sum((xhb - xb)**2 * mb, axis=1) / np.sum(mb, axis=1))
-        obs = full_df.loc[idx[0], "obs_pct"]
-        print(f"  {market:<10}  {err:>10.6f}  {obs:>5.1f}%")
+        idx  = full_df[full_df["market"] == market].index.tolist()
+        xb   = X_np[idx]
+        mb   = M_np[idx]
+        xhb  = Xhat[idx]
+        err  = np.mean(np.sum((xhb - xb)**2 * mb, axis=1) / np.sum(mb, axis=1))
+        obs  = full_df.loc[idx[0], "obs_pct"]
+        n_masked = int((mb == 0).sum() / len(idx))
+        print(f"  {market:<10}  {err:>10.6f}  {obs:>5.1f}%  {n_masked:>8} dims/row")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -374,20 +463,21 @@ print(f"Feature dim : {FEATURE_DIM}")
 print(f"Latent dim  : {LATENT_DIM}")
 print(f"Encoder     : {[2*FEATURE_DIM]} → {ENCODER_LAYERS} → [{LATENT_DIM}]")
 print(f"Decoder     : [{LATENT_DIM}] → {DECODER_LAYERS} → [{FEATURE_DIM}]")
+print(f"Random mask : {'enabled  ' if RANDOM_MASK_ENABLED else 'disabled '}"
+      f"{RANDOM_MASK_MIN*100:.0f}%–{RANDOM_MASK_MAX*100:.0f}% per row (train only)")
 
 print("\n[1/3] Loading data...")
 train_ds, val_ds, full_df, dim_cols = load_data()
-print(f"  Train rows : {len(train_ds)}")
-print(f"  Val rows   : {len(val_ds)}")
+print(f"  Train rows  : {len(train_ds)}")
+print(f"  Val rows    : {len(val_ds)}")
 
 print("\n[2/3] Training...")
 model = MaskAwareAutoencoder().to(device)
 model.apply(init_weights)
-total_params = sum(p.numel() for p in model.parameters())
-print(f"  Total params : {total_params:,}")
+print(f"  Total params : {sum(p.numel() for p in model.parameters()):,}")
 best_state = train(model, train_ds, val_ds, device)
 
-print("\n[3/3] Inference on all 65 rows...")
+print("\n[3/3] Inference on all 65 rows (structural mask only)...")
 run_inference(model, best_state, full_df, dim_cols, device)
 
 print("\n" + "=" * 60)

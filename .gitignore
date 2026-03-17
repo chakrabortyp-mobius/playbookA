@@ -2,4 +2,6 @@
 /mae_outputs
 /.venv
 /__pycache__
+/dae_outputs
 merged_tensor.csv
+/vae_outputs
