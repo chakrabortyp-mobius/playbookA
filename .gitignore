@@ -5,3 +5,4 @@
 /dae_outputs
 merged_tensor.csv
 /vae_outputs
+/viz_outputs
