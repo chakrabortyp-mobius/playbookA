@@ -253,38 +253,8 @@ def viz2_error_heatmap(error_fracs_path: str) -> str:
         color="white", fontsize=12, fontweight="bold", pad=12
     )
 
-    # Highlight expected patterns per domain knowledge
-    highlights = {
-        "IN-LOG": (["coordination", "operational"], "#00E676"),
-        "NG-FIN": (["measurement", "temporal"],     "#FFD600"),
-        "DE-HC" : (["regulatory"],                  "#2196F3"),
-        "US-ENR": (["techprod"],                    "#9C27B0"),
-    }
-    legend_patches = []
-    for mkt_name, (regime_list, color) in highlights.items():
-        if mkt_name not in mkts:
-            continue
-        i = mkts.index(mkt_name)
-        for r in regime_list:
-            if r in REGIMES:
-                j = REGIMES.index(r)
-                ax.add_patch(plt.Rectangle(
-                    (j - 0.5, i - 0.5), 1, 1,
-                    fill=False, edgecolor=color, linewidth=2.5, zorder=5
-                ))
-        legend_patches.append(mpatches.Patch(
-            facecolor="none", edgecolor=color, linewidth=2,
-            label=f"{mkt_name}: expected high-friction regimes"
-        ))
-
-    if legend_patches:
-        ax.legend(handles=legend_patches, loc="lower right",
-                  facecolor=DARK_CARD, edgecolor="#444444",
-                  labelcolor="white", fontsize=7.5, framealpha=0.92)
-
-    ax.text(0.01, -0.18,
-            "Source: DAE Stage 2 e_m decomposed by subspace  |  "
-            "Borders = directionally expected per domain knowledge",
+    ax.text(0.01, -0.12,
+            "Source: DAE Stage 2 e_m decomposed by regime subspace",
             transform=ax.transAxes, fontsize=7, color="#666666")
 
     plt.tight_layout()
@@ -351,24 +321,6 @@ def viz3_cosine_matrix(tensor_csv_path: str) -> str:
                 ax.text(j, i, f"{val:.2f}", ha="center", va="center",
                         fontsize=5.5, color=tc)
 
-        # Highlight key diagnostic pairs
-        pairs = []
-        if mkt in ("IN-LOG", "NG-FIN"):
-            # measurement(1) vs operational(5) — low = high IA signal
-            pairs += [((1, 5), "#FF5722"), ((5, 1), "#FF5722")]
-        if mkt == "IN-LOG":
-            # coordination(2) vs operational(5) — low = high CF signal
-            pairs += [((2, 5), "#FF9800"), ((5, 2), "#FF9800")]
-        if mkt == "DE-HC":
-            # regulatory(3) vs techprod(4) — high = RP signal
-            pairs += [((3, 4), "#2196F3"), ((4, 3), "#2196F3")]
-
-        for (i, j), col in pairs:
-            ax.add_patch(plt.Rectangle(
-                (j - 0.5, i - 0.5), 1, 1,
-                fill=False, edgecolor=col, linewidth=2.5, zorder=5
-            ))
-
         ax.set_title(mkt, color=MARKET_META[mkt]["color"],
                      fontsize=11, fontweight="bold", pad=6)
 
@@ -386,18 +338,9 @@ def viz3_cosine_matrix(tensor_csv_path: str) -> str:
         "Low = regime embeddings disagree = structural friction signal",
         color="white", fontsize=12, fontweight="bold", y=1.03
     )
-    fig.legend(handles=[
-        mpatches.Patch(facecolor="none", edgecolor="#FF5722", linewidth=2,
-                       label="Measurement vs Operational — IA signal (low for IN-LOG, NG-FIN)"),
-        mpatches.Patch(facecolor="none", edgecolor="#FF9800", linewidth=2,
-                       label="Coordination vs Operational — CF signal (low for IN-LOG)"),
-        mpatches.Patch(facecolor="none", edgecolor="#2196F3", linewidth=2,
-                       label="Regulatory vs TechProd — RP signal (high for DE-HC)"),
-    ], loc="lower center", ncol=3, facecolor=DARK_CARD, edgecolor="#444444",
-       labelcolor="white", fontsize=7.5,
-       bbox_to_anchor=(0.46, -0.10), framealpha=0.92)
 
-    plt.tight_layout(rect=[0, 0, 0.92, 1])
+
+    plt.subplots_adjust(left=0.05, right=0.91, top=0.88, bottom=0.18, wspace=0.15)
     out = os.path.join(OUTPUT_DIR, "3_cosine_agreement_matrix.png")
     plt.savefig(out, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
