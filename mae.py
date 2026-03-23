@@ -69,6 +69,9 @@ BIAS_INIT    = "zeros"
 RANDOM_SEED  = 42
 PRINT_EVERY  = 50
 
+DATA_POOR_MARKETS = ["IN-LOG", "NG-FIN"]   # OECD not a member → r_regulatory + r_techprod zeroed
+BIS_ABSENT        = ["NG-FIN"]   ## not a BIS reporting economy → r_temporal zeroed
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -222,21 +225,25 @@ def mae_loss(x_hat, x_true, mask):
 # DATA
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_structural_mask(sub_df: pd.DataFrame, dim_cols: list) -> torch.Tensor:
-    """
-    Structural mask: 0 for dims that are permanently missing due to absent
-    data sources (OECD for India/Nigeria, BIS for Nigeria).
-    This mask is fixed and applies at both train and inference time.
-    """
+def build_structural_mask(sub_df, dim_cols):
     X = torch.tensor(sub_df[dim_cols].values, dtype=torch.float32)
     M = torch.ones_like(X)
+
+    # Compute once from actual column names — no magic numbers
+    reg_idx = [i for i, c in enumerate(dim_cols) if c.startswith("r_regulatory")]
+    tec_idx = [i for i, c in enumerate(dim_cols) if c.startswith("r_techprod")]
+    tmp_idx = [i for i, c in enumerate(dim_cols) if c.startswith("r_temporal")]
+    reg_s, reg_e = reg_idx[0], reg_idx[-1] + 1   # 24:32
+    tec_s, tec_e = tec_idx[0], tec_idx[-1] + 1   # 32:40
+    tmp_s, tmp_e = tmp_idx[0], tmp_idx[-1] + 1   # 64:72
+
     for i, (_, row) in enumerate(sub_df.iterrows()):
         if row["obs_pct"] < 100.0:
-            if row["market"] in ["IN-LOG", "NG-FIN"]:
-                M[i, 24:28] = 0   # regulatory dims — OECD absent
-                M[i, 32:36] = 0   # techprod dims   — OECD absent
-            if row["market"] == "NG-FIN":
-                M[i, 64:68] = 0   # temporal dims   — BIS absent
+            if row["market"] in DATA_POOR_MARKETS:
+                M[i, reg_s:reg_e] = 0   # full r_regulatory block
+                M[i, tec_s:tec_e] = 0   # full r_techprod block
+            if row["market"] in BIS_ABSENT:
+                M[i, tmp_s:tmp_e] = 0   # full r_temporal block
     return X, M
 
 
