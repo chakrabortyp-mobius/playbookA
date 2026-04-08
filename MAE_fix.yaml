@@ -1,0 +1,333 @@
+name: MAE_fix
+description: Stage 1 Masked Autoencoder for canonicalization pipeline with data-driven masking from xm_tensor
+inputs:
+  - {name: xm_tensor, type: Object, optional: false}
+  - {name: latent_dim, type: Integer, optional: false}
+  - {name: encoder_layers, type: String, optional: false}
+  - {name: decoder_layers, type: String, optional: false}
+  - {name: dropout, type: Float, optional: false}
+  - {name: batch_norm, type: String, optional: false}
+  - {name: random_mask, type: String, optional: false}
+  - {name: mask_min, type: Float, optional: false}
+  - {name: mask_max, type: Float, optional: false}
+  - {name: epochs, type: Integer, optional: false}
+  - {name: lr, type: Float, optional: false}
+  - {name: batch_size, type: Integer, optional: false}
+  - {name: weight_decay, type: Float, optional: false}
+  - {name: val_split, type: Float, optional: false}
+outputs:
+  - {name: mae_latents, type: Object}
+  - {name: mae_reconstructed, type: Object}
+  - {name: mae_model, type: Object}
+  - {name: training_history, type: Object}
+implementation:
+  container:
+    image: gurpreetgandhi/nesy-factory:v1
+    command:
+      - python3
+      - -u
+      - -c
+      - |
+        	import os, sys, json, random, logging, time, argparse
+                from pathlib import Path
+                import numpy as np
+                import pandas as pd
+                import torch
+                import torch.nn as nn
+                import torch.optim as optim
+                from torch.utils.data import DataLoader, TensorDataset
+                
+                FEATURE_DIM = 355
+                ACTIVATION = "relu"
+                GRAD_CLIP_NORM = 1.0
+                SEED = 42
+                PRINT_EVERY = 50
+                LOSS_EPS = 1e-6
+                ES_MIN_DELTA = 1e-6
+                ES_PATIENCE = 30
+                META_COLS = ["iso3", "division", "year"]
+                
+                def set_seed(seed):
+                    random.seed(seed)
+                    np.random.seed(seed)
+                    torch.manual_seed(seed)
+                    torch.cuda.manual_seed_all(seed)
+                    torch.backends.cudnn.deterministic = True
+                    torch.backends.cudnn.benchmark = False
+                
+                def apply_weight_init(module):
+                    if isinstance(module, nn.Linear):
+                        nn.init.xavier_uniform_(module.weight)
+                        if module.bias is not None:
+                            nn.init.zeros_(module.bias)
+                    elif isinstance(module, nn.BatchNorm1d):
+                        nn.init.ones_(module.weight)
+                        nn.init.zeros_(module.bias)
+                
+                def masked_mse(x_hat, x_true, mask):
+                    err = torch.square(x_hat - x_true) * mask
+                    num = err.sum(dim=1)
+                    den = torch.clamp(mask.sum(dim=1), min=LOSS_EPS)
+                    return (num / den).mean()
+                
+                def apply_random_mask(x, struct_mask, mask_min, mask_max):
+                    combined = struct_mask.clone()
+                    for i in range(x.shape[0]):
+                        observed_idx = torch.where(struct_mask[i] == 1)[0]
+                        n_obs = len(observed_idx)
+                        if n_obs == 0:
+                            continue
+                        frac = np.random.uniform(mask_min, mask_max)
+                        n_to_mask = min(max(1, int(round(frac * FEATURE_DIM))), n_obs)
+                        perm = torch.randperm(n_obs)
+                        combined[i, observed_idx[perm[:n_to_mask]]] = 0
+                    return combined
+                
+                def load_xm_tensor(path):
+                    parquet_files = list(Path(path).glob("*.parquet"))
+                    if parquet_files:
+                        df = pd.read_parquet(parquet_files[0])
+                    else:
+                        csv_files = list(Path(path).glob("*.csv"))
+                        if not csv_files:
+                            raise FileNotFoundError(f"No .parquet or .csv found in {path}")
+                        df = pd.read_csv(csv_files[0])
+                    all_cols = df.columns.tolist()
+                    mask_cols = [c for c in all_cols if c.startswith("mask_")]
+                    data_cols = [c.replace("mask_", "", 1) for c in mask_cols if c.replace("mask_", "", 1) in all_cols]
+                    if not data_cols:
+                        data_cols = [c for c in all_cols if c not in META_COLS and not c.startswith("mask_")]
+                    X = df[data_cols].fillna(0.0).values.astype(np.float32)
+                    M = df[mask_cols].fillna(0.0).values.astype(np.float32) if mask_cols else (X != 0.0).astype(np.float32)
+                    M = np.clip(M, 0.0, 1.0)
+                    meta = df[META_COLS].copy()
+                    meta["market_id"] = meta["iso3"].astype(str) + "_" + meta["division"].astype(str)
+                    obs_pct = (M > 0.1).mean(axis=1) * 100
+                    meta["obs_pct"] = obs_pct
+                    return X, M, meta, data_cols
+                
+                class MAEEncoder(nn.Module):
+                    def __init__(self, feature_dim, encoder_dims, latent_dim, dropout, use_bn):
+                        super().__init__()
+                        prev = 2 * feature_dim
+                        layers = []
+                        for units in encoder_dims:
+                            layers.append(nn.Linear(prev, units))
+                            if use_bn: layers.append(nn.BatchNorm1d(units))
+                            layers.append(nn.ReLU())
+                            if dropout > 0: layers.append(nn.Dropout(dropout))
+                            prev = units
+                        layers.append(nn.Linear(prev, latent_dim))
+                        self.net = nn.Sequential(*layers)
+                    def forward(self, x, mask):
+                        return self.net(torch.cat([x, mask], dim=1))
+                
+                class MAEDecoder(nn.Module):
+                    def __init__(self, latent_dim, decoder_dims, feature_dim, dropout, use_bn):
+                        super().__init__()
+                        prev = latent_dim
+                        layers = []
+                        for units in decoder_dims:
+                            layers.append(nn.Linear(prev, units))
+                            if use_bn: layers.append(nn.BatchNorm1d(units))
+                            layers.append(nn.ReLU())
+                            if dropout > 0: layers.append(nn.Dropout(dropout))
+                            prev = units
+                        layers.append(nn.Linear(prev, feature_dim))
+                        self.net = nn.Sequential(*layers)
+                    def forward(self, z):
+                        return self.net(z)
+                
+                class MaskAwareAutoencoder(nn.Module):
+                    def __init__(self, feature_dim, encoder_dims, decoder_dims, latent_dim, dropout, use_bn):
+                        super().__init__()
+                        self.feature_dim = feature_dim
+                        self.latent_dim = latent_dim
+                        self.encoder = MAEEncoder(feature_dim, encoder_dims, latent_dim, dropout, use_bn)
+                        self.decoder = MAEDecoder(latent_dim, decoder_dims, feature_dim, dropout, use_bn)
+                    def forward(self, x, mask):
+                        z = self.encoder(x, mask)
+                        x_hat = self.decoder(z)
+                        return x_hat, z
+                
+                def train_mae(X, M, meta, args, device, feature_dim):
+                    markets = meta["market_id"].unique().tolist()
+                    rng = np.random.default_rng(SEED)
+                    if args.val_split > 0.0:
+                        n_val = max(1, round(len(markets) * args.val_split))
+                        val_mkts = set(rng.choice(markets, size=n_val, replace=False).tolist())
+                    else:
+                        val_mkts = set()
+                    trn_mkts = set(m for m in markets if m not in val_mkts)
+                    trn_idx = meta[meta["market_id"].isin(trn_mkts)].index.tolist()
+                    val_idx = meta[meta["market_id"].isin(val_mkts)].index.tolist() if val_mkts else trn_idx
+                    X_trn = torch.from_numpy(X[trn_idx]).float()
+                    M_trn = torch.from_numpy(M[trn_idx]).float()
+                    X_val = torch.from_numpy(X[val_idx]).float()
+                    M_val = torch.from_numpy(M[val_idx]).float()
+                    model = MaskAwareAutoencoder(feature_dim=feature_dim, encoder_dims=args.encoder_dims, decoder_dims=args.decoder_dims, latent_dim=args.latent_dim, dropout=args.dropout, use_bn=args.batch_norm).to(device)
+                    model.apply(apply_weight_init)
+                    model.train()
+                    _xh, _z = model(torch.randn(4, feature_dim).to(device), torch.ones(4, feature_dim).to(device))
+                    assert _xh.shape == (4, feature_dim) and _z.shape == (4, args.latent_dim)
+                    train_loader = DataLoader(TensorDataset(X_trn, M_trn), batch_size=args.batch_size, shuffle=True)
+                    val_loader = DataLoader(TensorDataset(X_val, M_val), batch_size=args.batch_size, shuffle=False)
+                    optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+                    history = {"train_loss": [], "val_loss": []}
+                    best_val, best_epoch, patience_ctr, best_state = float("inf"), 0, 0, None
+                    for epoch in range(args.epochs):
+                        model.train()
+                        t_losses = []
+                        for xb, mb in train_loader:
+                            xb, mb = xb.to(device), mb.to(device)
+                            mb_aug = apply_random_mask(xb, mb, args.mask_min, args.mask_max) if args.random_mask else mb
+                            x_hat, _ = model(xb * mb_aug, mb_aug)
+                            loss = masked_mse(x_hat, xb, mb)
+                            optimizer.zero_grad()
+                            loss.backward()
+                            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
+                            optimizer.step()
+                            t_losses.append(loss.item())
+                        model.eval()
+                        v_losses = []
+                        with torch.no_grad():
+                            for xb, mb in val_loader:
+                                xb, mb = xb.to(device), mb.to(device)
+                                x_hat, _ = model(xb, mb)
+                                v_losses.append(masked_mse(x_hat, xb, mb).item())
+                        avg_t = float(np.mean(t_losses))
+                        avg_v = float(np.mean(v_losses))
+                        history["train_loss"].append(avg_t)
+                        history["val_loss"].append(avg_v)
+                        if avg_v < best_val - ES_MIN_DELTA:
+                            best_val, best_epoch, patience_ctr = avg_v, epoch+1, 0
+                            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+                        else:
+                            patience_ctr += 1
+                        if patience_ctr >= ES_PATIENCE:
+                            break
+                    model.load_state_dict(best_state)
+                    return model, history, best_epoch, best_val
+                
+                def run_inference(model, X, M, meta, args, device, data_cols, feature_dim):
+                    model.eval()
+                    X_t = torch.from_numpy(X).float()
+                    M_t = torch.from_numpy(M).float()
+                    all_z, all_xhat = [], []
+                    loader = DataLoader(TensorDataset(X_t, M_t), batch_size=args.batch_size, shuffle=False)
+                    with torch.no_grad():
+                        for xb, mb in loader:
+                            xb, mb = xb.to(device), mb.to(device)
+                            x_hat, z = model(xb, mb)
+                            all_z.append(z.cpu().numpy())
+                            all_xhat.append(x_hat.cpu().numpy())
+                    Z = np.vstack(all_z)
+                    Xhat = np.vstack(all_xhat)
+                    latent_df = pd.DataFrame(Z, columns=[f"latent_{i}" for i in range(Z.shape[1])])
+                    latent_df.insert(0, "iso3", meta["iso3"].values)
+                    latent_df.insert(1, "division", meta["division"].values)
+                    latent_df.insert(2, "year", meta["year"].values)
+                    latent_df.insert(3, "obs_pct", meta["obs_pct"].values)
+                    recon_df = pd.DataFrame(Xhat, columns=data_cols)
+                    recon_df.insert(0, "iso3", meta["iso3"].values)
+                    recon_df.insert(1, "division", meta["division"].values)
+                    recon_df.insert(2, "year", meta["year"].values)
+                    return latent_df, recon_df, Z
+                
+                def str_to_bool(s):
+                    return str(s).lower() in ["true", "1", "yes"]
+                
+                try:
+                    parser = argparse.ArgumentParser()
+                    parser.add_argument("--xm_tensor", type=str, required=True)
+                    parser.add_argument("--latent_dim", type=int, required=True)
+                    parser.add_argument("--encoder_layers", type=str, required=True)
+                    parser.add_argument("--decoder_layers", type=str, required=True)
+                    parser.add_argument("--dropout", type=float, required=True)
+                    parser.add_argument("--batch_norm", type=str, required=True)
+                    parser.add_argument("--random_mask", type=str, required=True)
+                    parser.add_argument("--mask_min", type=float, required=True)
+                    parser.add_argument("--mask_max", type=float, required=True)
+                    parser.add_argument("--epochs", type=int, required=True)
+                    parser.add_argument("--lr", type=float, required=True)
+                    parser.add_argument("--batch_size", type=int, required=True)
+                    parser.add_argument("--weight_decay", type=float, required=True)
+                    parser.add_argument("--val_split", type=float, required=True)
+                    parser.add_argument("--mae_latents", type=str, required=True)
+                    parser.add_argument("--mae_reconstructed", type=str, required=True)
+                    parser.add_argument("--mae_model", type=str, required=True)
+                    parser.add_argument("--training_history", type=str, required=True)
+                    args = parser.parse_args()
+                
+                    args.encoder_dims = [int(x.strip()) for x in args.encoder_layers.split(",")]
+                    args.decoder_dims = [int(x.strip()) for x in args.decoder_layers.split(",")]
+                    args.random_mask = str_to_bool(args.random_mask)
+                    args.batch_norm = str_to_bool(args.batch_norm)
+                
+                    set_seed(SEED)
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                
+                    X, M, meta, data_cols = load_xm_tensor(args.xm_tensor)
+                    actual_dim = X.shape[1]
+                
+                    model, history, best_epoch, best_val = train_mae(X, M, meta, args, device, actual_dim)
+                
+                    latent_df, recon_df, Z = run_inference(model, X, M, meta, args, device, data_cols, actual_dim)
+                
+                    os.makedirs(args.mae_latents, exist_ok=True)
+                    latents_path = os.path.join(args.mae_latents, "mae_latents.parquet")
+                    latent_df.to_parquet(latents_path, index=False)
+                
+                    os.makedirs(args.mae_reconstructed, exist_ok=True)
+                    recon_path = os.path.join(args.mae_reconstructed, "mae_reconstructed.parquet")
+                    recon_df.to_parquet(recon_path, index=False)
+                
+                    os.makedirs(args.mae_model, exist_ok=True)
+                    model_config = {"feature_dim": FEATURE_DIM, "latent_dim": args.latent_dim, "encoder_dims": args.encoder_dims, "decoder_dims": args.decoder_dims, "dropout": args.dropout, "batch_norm": args.batch_norm, "random_mask": {"enabled": args.random_mask, "min": args.mask_min, "max": args.mask_max}}
+                    ckpt_path = os.path.join(args.mae_model, "mae_best_model.pth")
+                    torch.save({"epoch": best_epoch, "model_state_dict": {k: v.cpu() for k, v in model.state_dict().items()}, "val_loss": best_val, "model_config": model_config, "architecture": "MaskAwareAutoencoder_V2"}, ckpt_path)
+                
+                    os.makedirs(args.training_history, exist_ok=True)
+                    hist_path = os.path.join(args.training_history, "mae_training_history.json")
+                    with open(hist_path, "w") as f:
+                        json.dump({**history, "best_epoch": best_epoch, "best_val_loss": best_val, "epochs_trained": len(history["train_loss"]), "model_config": model_config}, f, indent=2)
+                
+                except Exception as e:
+                    sys.exit(1)
+    args:
+      - --xm_tensor
+      - {inputPath: xm_tensor}
+      - --latent_dim
+      - {inputValue: latent_dim}
+      - --encoder_layers
+      - {inputValue: encoder_layers}
+      - --decoder_layers
+      - {inputValue: decoder_layers}
+      - --dropout
+      - {inputValue: dropout}
+      - --batch_norm
+      - {inputValue: batch_norm}
+      - --random_mask
+      - {inputValue: random_mask}
+      - --mask_min
+      - {inputValue: mask_min}
+      - --mask_max
+      - {inputValue: mask_max}
+      - --epochs
+      - {inputValue: epochs}
+      - --lr
+      - {inputValue: lr}
+      - --batch_size
+      - {inputValue: batch_size}
+      - --weight_decay
+      - {inputValue: weight_decay}
+      - --val_split
+      - {inputValue: val_split}
+      - --mae_latents
+      - {outputPath: mae_latents}
+      - --mae_reconstructed
+      - {outputPath: mae_reconstructed}
+      - --mae_model
+      - {outputPath: mae_model}
+      - --training_history
+      - {outputPath: training_history}
