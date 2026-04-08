@@ -1,4 +1,4 @@
-name: MAE_fix
+name: MAE_fix1
 description: Stage 1 Masked Autoencoder for canonicalization pipeline with data-driven masking from xm_tensor
 inputs:
   - {name: xm_tensor, type: Object, optional: false}
